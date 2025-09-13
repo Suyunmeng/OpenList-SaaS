@@ -1,0 +1,323 @@
+name: Release builds (Docker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      manual_tag:
+        description: 'Specific tag to download binaries from OpenListTeam/OpenList (e.g., v0.1.0). If empty, will use the latest tag.'
+        required: false
+        type: string
+      as_latest:
+        description: 'Tag as latest?'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOCKERHUB_ORG_NAME: ${{ vars.DOCKERHUB_ORG_NAME || 'openlistteam' }}
+  GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'openlistteam' }}
+  IMAGE_NAME: openlist-git-saas
+  IMAGE_NAME_DOCKERHUB: openlist-saas
+  REGISTRY: ghcr.io
+  ARTIFACT_NAME: 'binaries_docker_release'
+  ARTIFACT_NAME_LITE: 'binaries_docker_release_lite'
+  RELEASE_PLATFORMS: 'linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/arm/v6,linux/ppc64le,linux/riscv64,linux/loong64' ### Temporarily disable Docker builds for linux/s390x architectures for unknown reasons.
+  IMAGE_PUSH: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+
+permissions:
+  packages: write
+
+jobs:
+  download_binaries:
+    name: Download Binaries from OpenList Repository
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.set-tag.outputs.tag }}
+    steps:
+      - name: Set target tag
+        id: set-tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.manual_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.manual_tag }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            # Get latest tag from OpenListTeam/OpenList repository
+            latest_tag=$(curl -s https://api.github.com/repos/OpenListTeam/OpenList/releases/latest | jq -r '.tag_name')
+            echo "tag=$latest_tag" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get workflow run ID for the tag
+        id: get-run-id
+        run: |
+          TARGET_TAG="${{ steps.set-tag.outputs.tag }}"
+          echo "Looking for workflow runs with tag: $TARGET_TAG"
+          
+          # Get the workflow runs for the release_docker.yml workflow
+          WORKFLOW_RUNS=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/OpenListTeam/OpenList/actions/workflows/release_docker.yml/runs?status=completed&event=push")
+          
+          # Find the run ID for the specific tag
+          RUN_ID=$(echo "$WORKFLOW_RUNS" | jq -r --arg tag "$TARGET_TAG" '.workflow_runs[] | select(.head_branch == $tag and .conclusion == "success") | .id' | head -1)
+          
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No successful workflow run found for tag $TARGET_TAG"
+            exit 1
+          fi
+          
+          echo "run-id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "Found workflow run ID: $RUN_ID for tag: $TARGET_TAG"
+
+      - name: Download binaries_docker_release artifact
+        run: |
+          RUN_ID="${{ steps.get-run-id.outputs.run-id }}"
+          
+          # Get artifacts for the specific run
+          ARTIFACTS=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/OpenListTeam/OpenList/actions/runs/$RUN_ID/artifacts")
+          
+          # Get binaries_docker_release artifact
+          ARTIFACT_ID=$(echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name == "binaries_docker_release") | .id')
+          
+          if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
+            echo "binaries_docker_release artifact not found"
+            exit 1
+          fi
+          
+          # Download and extract the artifact
+          curl -L \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/OpenListTeam/OpenList/actions/artifacts/$ARTIFACT_ID/zip" \
+            -o binaries_docker_release.zip
+            
+          mkdir -p build/
+          unzip binaries_docker_release.zip -d build/
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download binaries_docker_release_lite artifact
+        run: |
+          RUN_ID="${{ steps.get-run-id.outputs.run-id }}"
+          
+          # Get artifacts for the specific run
+          ARTIFACTS=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/OpenListTeam/OpenList/actions/runs/$RUN_ID/artifacts")
+          
+          # Get binaries_docker_release_lite artifact
+          ARTIFACT_ID=$(echo "$ARTIFACTS" | jq -r '.artifacts[] | select(.name == "binaries_docker_release_lite") | .id')
+          
+          if [ -z "$ARTIFACT_ID" ] || [ "$ARTIFACT_ID" = "null" ]; then
+            echo "binaries_docker_release_lite artifact not found"
+            exit 1
+          fi
+          
+          # Download and extract the artifact
+          curl -L \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/OpenListTeam/OpenList/actions/artifacts/$ARTIFACT_ID/zip" \
+            -o binaries_docker_release_lite.zip
+            
+          mkdir -p build_lite/
+          unzip binaries_docker_release_lite.zip -d build_lite/
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload standard artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          overwrite: true
+          path: build/
+
+      - name: Upload lite artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME_LITE }}
+          overwrite: true
+          path: build_lite/
+
+  release_docker:
+    needs: download_binaries
+    name: Release Docker image
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ["latest", "ffmpeg", "aria2", "aio"]
+        include:
+          - image: "latest"
+            base_image_tag: "base"
+            build_arg: ""
+            tag_favor: ""
+          - image: "ffmpeg"
+            base_image_tag: "ffmpeg"
+            build_arg: INSTALL_FFMPEG=true
+            tag_favor: "suffix=-ffmpeg,onlatest=true"
+          - image: "aria2"
+            base_image_tag: "aria2"
+            build_arg: INSTALL_ARIA2=true
+            tag_favor: "suffix=-aria2,onlatest=true"
+          - image: "aio"
+            base_image_tag: "aio"
+            build_arg: |
+              INSTALL_FFMPEG=true
+              INSTALL_ARIA2=true
+            tag_favor: "suffix=-aio,onlatest=true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: 'build/'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: env.IMAGE_PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to DockerHub Container Registry
+        if: env.IMAGE_PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_ORG_NAME_BACKUP || env.DOCKERHUB_ORG_NAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_ORG_NAME }}/${{ env.IMAGE_NAME_DOCKERHUB }}
+          tags: >
+            ${{ github.event_name == 'workflow_dispatch'
+                && format('type=raw,value={0}', github.event.inputs.manual_tag)
+              || format('type=raw,value={0}', github.ref_name) }}
+          flavor: |
+            latest=${{ github.event_name == 'push' || github.event.inputs.as_latest == 'true' }}
+            ${{ matrix.tag_favor }}
+
+      - name: Build and push
+        id: docker_build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ci
+          push: ${{ env.IMAGE_PUSH == 'true' }}
+          build-args: |
+            BASE_IMAGE_TAG=${{ matrix.base_image_tag }}
+            ${{ matrix.build_arg }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ env.RELEASE_PLATFORMS }}
+
+  release_docker_lite:
+    needs: download_binaries
+    name: Release Docker image (Lite)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ["latest", "ffmpeg", "aria2", "aio"]
+        include:
+          - image: "latest"
+            base_image_tag: "base"
+            build_arg: ""
+            tag_favor: "suffix=-lite,onlatest=true"
+          - image: "ffmpeg"
+            base_image_tag: "ffmpeg"
+            build_arg: INSTALL_FFMPEG=true
+            tag_favor: "suffix=-lite-ffmpeg,onlatest=true"
+          - image: "aria2"
+            base_image_tag: "aria2"
+            build_arg: INSTALL_ARIA2=true
+            tag_favor: "suffix=-lite-aria2,onlatest=true"
+          - image: "aio"
+            base_image_tag: "aio"
+            build_arg: |
+              INSTALL_FFMPEG=true
+              INSTALL_ARIA2=true
+            tag_favor: "suffix=-lite-aio,onlatest=true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME_LITE }}
+          path: 'build/'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: env.IMAGE_PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to DockerHub Container Registry
+        if: env.IMAGE_PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_ORG_NAME_BACKUP || env.DOCKERHUB_ORG_NAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_ORG_NAME }}/${{ env.IMAGE_NAME_DOCKERHUB }}
+          tags: >
+            ${{ github.event_name == 'workflow_dispatch'
+                && format('type=raw,value={0}', github.event.inputs.manual_tag)
+              || format('type=raw,value={0}', github.ref_name) }}
+          flavor: |
+            latest=${{ github.event_name == 'push' || github.event.inputs.as_latest == 'true' }}
+            ${{ matrix.tag_favor }}
+
+      - name: Build and push
+        id: docker_build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ci
+          push: ${{ env.IMAGE_PUSH == 'true' }}
+          build-args: |
+            BASE_IMAGE_TAG=${{ matrix.base_image_tag }}
+            ${{ matrix.build_arg }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ env.RELEASE_PLATFORMS }}
