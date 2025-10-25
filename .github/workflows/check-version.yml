@@ -1,0 +1,75 @@
+name: Check OpenList Version Update
+
+on:
+  schedule:
+    # Beijing Time 02:00 = UTC 18:00 (previous day)
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: Check for OpenList version updates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get current version from file
+        id: current-version
+        run: |
+          CURRENT_VERSION=$(cat openlist_version | tr -d '[:space:]')
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current version in file: $CURRENT_VERSION"
+
+      - name: Get latest version from OpenList API
+        id: latest-version
+        run: |
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/OpenListTeam/OpenList/releases/latest | jq -r '.tag_name')
+          echo "version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+          echo "Latest version from API: $LATEST_VERSION"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          CURRENT="${{ steps.current-version.outputs.version }}"
+          LATEST="${{ steps.latest-version.outputs.version }}"
+          
+          if [ "$CURRENT" = "$LATEST" ]; then
+            echo "Version match. No update needed."
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "Version mismatch detected!"
+            echo "Current: $CURRENT"
+            echo "Latest: $LATEST"
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update version file and commit
+        if: steps.compare.outputs.needs_update == 'true'
+        run: |
+          LATEST_VERSION="${{ steps.latest-version.outputs.version }}"
+          echo "$LATEST_VERSION" > openlist_version
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add openlist_version
+          git commit -m "feat(ci): update OpenList version to $LATEST_VERSION"
+          git push
+
+      - name: Trigger Docker image build
+        if: steps.compare.outputs.needs_update == 'true'
+        run: |
+          LATEST_VERSION="${{ steps.latest-version.outputs.version }}"
+          
+          curl -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/docker-image.yml/dispatches \
+            -d "{\"ref\":\"main\",\"inputs\":{\"manual_tag\":\"$LATEST_VERSION\",\"as_latest\":\"true\"}}"
+          
+          echo "Triggered Docker image build for version $LATEST_VERSION"
